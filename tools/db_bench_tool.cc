@@ -868,6 +868,12 @@ DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
 DEFINE_bool(disable_wal, false, "If true, do not write WAL for write.");
 
+DEFINE_bool(reopen_after_each_op, false,
+            "If true, each thread opens the DB, performs one write operation, "
+            "and closes it, simulating multiprocess access with lock "
+            "contention. Threads retry with backoff when the DB lock is held "
+            "by another thread.");
+
 DEFINE_bool(manual_wal_flush, false,
             "If true, buffer WAL until buffer is full or a manual FlushWAL().");
 
@@ -3913,6 +3919,11 @@ class Benchmark {
         Open(&open_options_, hooks);  // use open_options for the last accessed
       }
 
+      // In reopen mode, close the shared DB so each thread can open its own.
+      if (FLAGS_reopen_after_each_op && db_.db != nullptr) {
+        db_.DeleteDBs();
+      }
+
       if (method != nullptr) {
         fprintf(stdout, "DB path: [%s]\n", FLAGS_db.c_str());
 
@@ -5264,6 +5275,145 @@ class Benchmark {
     }
   }
 
+  // Like OpenDb but returns Status instead of exiting on failure.
+  // Used by OpenDbWithRetry for reopen_after_each_op mode.
+  Status TryOpenDb(Options options, ToolHooks& hooks,
+                   const std::string& db_name, DBWithColumnFamilies* db) {
+    Status s;
+    if (FLAGS_num_column_families > 1) {
+      size_t num_hot = FLAGS_num_column_families;
+      if (FLAGS_num_hot_column_families > 0 &&
+          FLAGS_num_hot_column_families < FLAGS_num_column_families) {
+        num_hot = FLAGS_num_hot_column_families;
+      } else {
+        FLAGS_num_hot_column_families = FLAGS_num_column_families;
+      }
+      std::vector<ColumnFamilyDescriptor> column_families;
+      for (size_t i = 0; i < num_hot; i++) {
+        column_families.emplace_back(ColumnFamilyName(i),
+                                     ColumnFamilyOptions(options));
+      }
+      std::vector<int> cfh_idx_to_prob;
+      if (!FLAGS_column_family_distribution.empty()) {
+        std::stringstream cf_prob_stream(FLAGS_column_family_distribution);
+        std::string cf_prob;
+        int sum = 0;
+        while (std::getline(cf_prob_stream, cf_prob, ',')) {
+          cfh_idx_to_prob.push_back(std::stoi(cf_prob));
+          sum += cfh_idx_to_prob.back();
+        }
+        if (sum != 100) {
+          fprintf(stderr, "column_family_distribution items must sum to 100\n");
+          return Status::InvalidArgument(
+              "column_family_distribution items must sum to 100");
+        }
+        if (cfh_idx_to_prob.size() != num_hot) {
+          fprintf(stderr,
+                  "got %" ROCKSDB_PRIszt
+                  " column_family_distribution items; expected "
+                  "%" ROCKSDB_PRIszt "\n",
+                  cfh_idx_to_prob.size(), num_hot);
+          return Status::InvalidArgument(
+              "column_family_distribution size mismatch");
+        }
+      }
+      if (FLAGS_readonly) {
+        s = hooks.OpenForReadOnly(options, db_name, column_families, &db->cfh,
+                                  &db->db);
+      } else if (FLAGS_optimistic_transaction_db) {
+        s = hooks.OpenOptimisticTransactionDB(options, db_name, column_families,
+                                              &db->cfh, &db->opt_txn_db);
+        if (s.ok()) {
+          db->db = db->opt_txn_db->GetBaseDB();
+        }
+      } else if (FLAGS_transaction_db) {
+        TransactionDB* ptr;
+        TransactionDBOptions txn_db_options;
+        if (options.unordered_write) {
+          options.two_write_queues = true;
+          txn_db_options.skip_concurrency_control = true;
+          txn_db_options.write_policy = WRITE_PREPARED;
+        }
+        s = hooks.OpenTransactionDB(options, txn_db_options, db_name,
+                                    column_families, &db->cfh, &ptr);
+        if (s.ok()) {
+          db->db = ptr;
+        }
+      } else {
+        s = hooks.Open(options, db_name, column_families, &db->cfh, &db->db);
+      }
+      db->cfh.resize(FLAGS_num_column_families);
+      db->num_created = num_hot;
+      db->num_hot = num_hot;
+      db->cfh_idx_to_prob = std::move(cfh_idx_to_prob);
+    } else if (FLAGS_readonly) {
+      s = hooks.OpenForReadOnly(options, db_name, &db->db, false);
+    } else if (FLAGS_optimistic_transaction_db) {
+      s = hooks.OpenOptimisticTransactionDB(options, db_name, &db->opt_txn_db);
+      if (s.ok()) {
+        db->db = db->opt_txn_db->GetBaseDB();
+      }
+    } else if (FLAGS_transaction_db) {
+      TransactionDB* ptr = nullptr;
+      TransactionDBOptions txn_db_options;
+      if (options.unordered_write) {
+        options.two_write_queues = true;
+        txn_db_options.skip_concurrency_control = true;
+        txn_db_options.write_policy = WRITE_PREPARED;
+      }
+      s = CreateLoggerFromOptions(db_name, options, &options.info_log);
+      if (s.ok()) {
+        s = hooks.OpenTransactionDB(options, txn_db_options, db_name, &ptr);
+      }
+      if (s.ok()) {
+        db->db = ptr;
+      }
+    } else if (FLAGS_use_blob_db) {
+      blob_db::BlobDBOptions blob_db_options;
+      blob_db_options.enable_garbage_collection = FLAGS_blob_db_enable_gc;
+      blob_db_options.max_db_size = FLAGS_blob_db_max_db_size;
+      blob_db_options.ttl_range_secs = FLAGS_blob_db_ttl_range_secs;
+      blob_db_options.blob_file_size = FLAGS_blob_db_file_size;
+      blob_db::BlobDB* ptr = nullptr;
+      s = hooks.Open(options, blob_db_options, db_name, &ptr);
+      if (s.ok()) {
+        db->db = ptr;
+      }
+    } else if (FLAGS_use_secondary_db) {
+      if (FLAGS_secondary_path.empty()) {
+        std::string default_secondary_path;
+        FLAGS_env->GetTestDirectory(&default_secondary_path);
+        default_secondary_path += "/dbbench_secondary";
+        FLAGS_secondary_path = default_secondary_path;
+      }
+      s = hooks.OpenAsSecondary(options, db_name, FLAGS_secondary_path,
+                                &db->db);
+    } else if (FLAGS_open_as_follower) {
+      std::unique_ptr<DB> dbptr;
+      s = hooks.OpenAsFollower(options, db_name, FLAGS_leader_path, &dbptr);
+      if (s.ok()) {
+        db->db = dbptr.release();
+      }
+    } else {
+      s = hooks.Open(options, db_name, &db->db);
+    }
+    return s;
+  }
+
+  void OpenDbWithRetry(DBWithColumnFamilies* db) {
+    for (int attempt = 0;; ++attempt) {
+      Status s = TryOpenDb(open_options_, *hooks_, FLAGS_db, db);
+      if (s.ok()) return;
+      if (!s.IsIOError()) {
+        fprintf(stderr, "open error: %s\n", s.ToString().c_str());
+        db_bench_exit(1);
+      }
+      // Lock contention — backoff and retry (cap at 1ms)
+      int backoff_us = 100 * std::min(attempt + 1, 10);
+      FLAGS_env->SleepForMicroseconds(backoff_us);
+    }
+  }
+
   enum WriteMode { RANDOM, SEQUENTIAL, UNIQUE_RANDOM };
 
   void WriteSeqDeterministic(ThreadState* thread) {
@@ -5714,7 +5864,14 @@ class Benchmark {
           }
         }
       }
-      DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(id);
+      DBWithColumnFamilies local_db;
+      DBWithColumnFamilies* db_with_cfh;
+      if (FLAGS_reopen_after_each_op) {
+        OpenDbWithRetry(&local_db);
+        db_with_cfh = &local_db;
+      } else {
+        db_with_cfh = SelectDBWithCfh(id);
+      }
 
       batch.Clear();
       int64_t batch_bytes = 0;
@@ -5967,6 +6124,9 @@ class Benchmark {
       if (!s.ok()) {
         fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         ErrorExit();
+      }
+      if (FLAGS_reopen_after_each_op) {
+        local_db.DeleteDBs();
       }
     }
     if ((write_mode == UNIQUE_RANDOM) && (p > 0.0)) {
@@ -7998,7 +8158,14 @@ class Benchmark {
     }
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
-      DB* db = SelectDB(thread);
+      DBWithColumnFamilies local_db;
+      DB* db;
+      if (FLAGS_reopen_after_each_op) {
+        OpenDbWithRetry(&local_db);
+        db = local_db.db;
+      } else {
+        db = SelectDB(thread);
+      }
       GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
       Slice ts;
       if (user_timestamp_size_ > 0) {
@@ -8037,6 +8204,9 @@ class Benchmark {
       }
       bytes += key.size() + val.size() + user_timestamp_size_;
       thread->stats.FinishedOps(nullptr, db, 1, kUpdate);
+      if (FLAGS_reopen_after_each_op) {
+        local_db.DeleteDBs();
+      }
     }
     char msg[100];
     snprintf(msg, sizeof(msg), "( updates:%" PRIu64 " found:%" PRIu64 ")",
