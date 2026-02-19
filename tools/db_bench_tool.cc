@@ -5319,11 +5319,15 @@ class Benchmark {
       }
       if (FLAGS_readonly) {
         s = hooks.OpenForReadOnly(options, db_name, column_families, &db->cfh,
-                                  &db->db);
+                                  &db->db_owner);
+        if (s.ok()) {
+          db->db = db->db_owner.get();
+        }
       } else if (FLAGS_optimistic_transaction_db) {
         s = hooks.OpenOptimisticTransactionDB(options, db_name, column_families,
                                               &db->cfh, &db->opt_txn_db);
         if (s.ok()) {
+          db->db_owner.reset(db->opt_txn_db);
           db->db = db->opt_txn_db->GetBaseDB();
         }
       } else if (FLAGS_transaction_db) {
@@ -5337,20 +5341,29 @@ class Benchmark {
         s = hooks.OpenTransactionDB(options, txn_db_options, db_name,
                                     column_families, &db->cfh, &ptr);
         if (s.ok()) {
+          db->db_owner.reset(ptr);
           db->db = ptr;
         }
       } else {
-        s = hooks.Open(options, db_name, column_families, &db->cfh, &db->db);
+        s = hooks.Open(options, db_name, column_families, &db->cfh,
+                       &db->db_owner);
+        if (s.ok()) {
+          db->db = db->db_owner.get();
+        }
       }
       db->cfh.resize(FLAGS_num_column_families);
       db->num_created = num_hot;
       db->num_hot = num_hot;
       db->cfh_idx_to_prob = std::move(cfh_idx_to_prob);
     } else if (FLAGS_readonly) {
-      s = hooks.OpenForReadOnly(options, db_name, &db->db, false);
+      s = hooks.OpenForReadOnly(options, db_name, &db->db_owner, false);
+      if (s.ok()) {
+        db->db = db->db_owner.get();
+      }
     } else if (FLAGS_optimistic_transaction_db) {
       s = hooks.OpenOptimisticTransactionDB(options, db_name, &db->opt_txn_db);
       if (s.ok()) {
+        db->db_owner.reset(db->opt_txn_db);
         db->db = db->opt_txn_db->GetBaseDB();
       }
     } else if (FLAGS_transaction_db) {
@@ -5366,6 +5379,7 @@ class Benchmark {
         s = hooks.OpenTransactionDB(options, txn_db_options, db_name, &ptr);
       }
       if (s.ok()) {
+        db->db_owner.reset(ptr);
         db->db = ptr;
       }
     } else if (FLAGS_use_blob_db) {
@@ -5377,6 +5391,7 @@ class Benchmark {
       blob_db::BlobDB* ptr = nullptr;
       s = hooks.Open(options, blob_db_options, db_name, &ptr);
       if (s.ok()) {
+        db->db_owner.reset(ptr);
         db->db = ptr;
       }
     } else if (FLAGS_use_secondary_db) {
@@ -5387,22 +5402,33 @@ class Benchmark {
         FLAGS_secondary_path = default_secondary_path;
       }
       s = hooks.OpenAsSecondary(options, db_name, FLAGS_secondary_path,
-                                &db->db);
-    } else if (FLAGS_open_as_follower) {
-      std::unique_ptr<DB> dbptr;
-      s = hooks.OpenAsFollower(options, db_name, FLAGS_leader_path, &dbptr);
+                                &db->db_owner);
       if (s.ok()) {
-        db->db = dbptr.release();
+        db->db = db->db_owner.get();
+      }
+    } else if (FLAGS_open_as_follower) {
+      s = hooks.OpenAsFollower(options, db_name, FLAGS_leader_path,
+                               &db->db_owner);
+      if (s.ok()) {
+        db->db = db->db_owner.get();
       }
     } else {
-      s = hooks.Open(options, db_name, &db->db);
+      s = hooks.Open(options, db_name, &db->db_owner);
+      if (s.ok()) {
+        db->db = db->db_owner.get();
+      }
     }
     return s;
   }
 
-  void OpenDbWithRetry(DBWithColumnFamilies* db) {
+  void OpenDbWithRetry(DBWithColumnFamilies* db,
+                       uint64_t* open_nanos = nullptr) {
     for (int attempt = 0;; ++attempt) {
+      uint64_t start = open_nanos ? FLAGS_env->NowNanos() : 0;
       Status s = TryOpenDb(open_options_, *hooks_, FLAGS_db, db);
+      if (open_nanos) {
+        *open_nanos += FLAGS_env->NowNanos() - start;
+      }
       if (s.ok()) return;
       if (!s.IsIOError()) {
         fprintf(stderr, "open error: %s\n", s.ToString().c_str());
@@ -5834,6 +5860,7 @@ class Benchmark {
     int64_t next_seq_db_at = num_ops;
     size_t id = 0;
     int64_t num_range_deletions = 0;
+    uint64_t total_open_nanos = 0;
 
     while ((num_per_key_gen != 0) && !duration.Done(entries_per_batch_)) {
       if (duration.GetStage() != stage) {
@@ -5867,7 +5894,8 @@ class Benchmark {
       DBWithColumnFamilies local_db;
       DBWithColumnFamilies* db_with_cfh;
       if (FLAGS_reopen_after_each_op) {
-        OpenDbWithRetry(&local_db);
+        OpenDbWithRetry(&local_db,
+                        FLAGS_report_open_timing ? &total_open_nanos : nullptr);
         db_with_cfh = &local_db;
       } else {
         db_with_cfh = SelectDBWithCfh(id);
@@ -6143,6 +6171,12 @@ class Benchmark {
     if (num_range_deletions > 0) {
       std::cout << "Number of range deletions: " << num_range_deletions
                 << std::endl;
+    }
+    if (FLAGS_reopen_after_each_op && FLAGS_report_open_timing) {
+      char open_msg[100];
+      snprintf(open_msg, sizeof(open_msg), "( total_open_time: %.3f ms )",
+               total_open_nanos / 1000000.0);
+      thread->stats.AddMessage(open_msg);
     }
     thread->stats.AddBytes(bytes);
   }
@@ -8156,12 +8190,14 @@ class Benchmark {
     if (user_timestamp_size_ > 0) {
       ts_guard.reset(new char[user_timestamp_size_]);
     }
+    uint64_t total_open_nanos = 0;
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
       DBWithColumnFamilies local_db;
       DB* db;
       if (FLAGS_reopen_after_each_op) {
-        OpenDbWithRetry(&local_db);
+        OpenDbWithRetry(&local_db,
+                        FLAGS_report_open_timing ? &total_open_nanos : nullptr);
         db = local_db.db;
       } else {
         db = SelectDB(thread);
@@ -8211,6 +8247,12 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "( updates:%" PRIu64 " found:%" PRIu64 ")",
              readwrites_, found);
+    if (FLAGS_reopen_after_each_op && FLAGS_report_open_timing) {
+      char open_msg[100];
+      snprintf(open_msg, sizeof(open_msg), "( total_open_time: %.3f ms )",
+               total_open_nanos / 1000000.0);
+      thread->stats.AddMessage(open_msg);
+    }
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);
   }
