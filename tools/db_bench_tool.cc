@@ -2268,6 +2268,7 @@ class Stats {
   uint64_t bytes_;
   uint64_t last_op_finish_;
   uint64_t last_report_finish_;
+  uint64_t open_attempts_{0};
   std::unordered_map<OperationType, std::shared_ptr<HistogramImpl>,
                      std::hash<unsigned char>>
       hist_;
@@ -2292,6 +2293,7 @@ class Stats {
     last_report_done_ = 0;
     bytes_ = 0;
     seconds_ = 0;
+    open_attempts_ = 0;
     start_ = clock_->NowMicros();
     sine_interval_ = clock_->NowMicros();
     finish_ = start_;
@@ -2318,6 +2320,7 @@ class Stats {
     done_ += other.done_;
     bytes_ += other.bytes_;
     seconds_ += other.seconds_;
+    open_attempts_ += other.open_attempts_;
     if (other.start_ < start_) {
       start_ = other.start_;
     }
@@ -2510,6 +2513,8 @@ class Stats {
 
   void AddBytes(int64_t n) { bytes_ += n; }
 
+  void AddOpenAttempts(int n) { open_attempts_ += n; }
+
   void Report(const Slice& name) {
     // Pretend at least one op was done in case we are running a benchmark
     // that does not call FinishedOps().
@@ -2528,6 +2533,12 @@ class Stats {
       extra = rate;
     }
     AppendWithSpace(&extra, message_);
+    if (open_attempts_ > 0 && done_ > 0) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "( avg_open_attempts: %.2f )",
+              static_cast<double>(open_attempts_) / done_);
+      AppendWithSpace(&extra, buf);
+    }
     double throughput = (double)done_ / elapsed;
 
     fprintf(stdout,
@@ -5060,7 +5071,11 @@ class Benchmark {
     }
 
     if (FLAGS_num_multi_db <= 1) {
-      OpenDb(options, hooks, FLAGS_db, &db_);
+      if (FLAGS_reopen_after_each_op) {
+        OpenDbWithRetry(&db_);
+      } else {
+        OpenDb(options, hooks, FLAGS_db, &db_);
+      }
     } else {
       multi_dbs_.clear();
       multi_dbs_.resize(FLAGS_num_multi_db);
@@ -5422,14 +5437,24 @@ class Benchmark {
   }
 
   void OpenDbWithRetry(DBWithColumnFamilies* db,
-                       uint64_t* open_nanos = nullptr) {
+                       uint64_t* open_nanos = nullptr,
+                       uint64_t* open_attempts = nullptr) {
     for (int attempt = 0;; ++attempt) {
       uint64_t start = open_nanos ? FLAGS_env->NowNanos() : 0;
       Status s = TryOpenDb(open_options_, *hooks_, FLAGS_db, db);
       if (open_nanos) {
         *open_nanos += FLAGS_env->NowNanos() - start;
       }
-      if (s.ok()) return;
+      if (s.ok()) {
+        if (open_attempts) {
+          *open_attempts = attempt + 1;
+        }
+        // if (attempt > 0) {
+        //   fprintf(stderr, "[reopen] OpenDbWithRetry succeeded on attempt %d\n",
+        //           attempt);
+        // }
+        return;
+      }
       if (!s.IsIOError()) {
         fprintf(stderr, "open error: %s\n", s.ToString().c_str());
         db_bench_exit(1);
@@ -5861,6 +5886,7 @@ class Benchmark {
     size_t id = 0;
     int64_t num_range_deletions = 0;
     uint64_t total_open_nanos = 0;
+    uint64_t total_open_attempts = 0;
 
     while ((num_per_key_gen != 0) && !duration.Done(entries_per_batch_)) {
       if (duration.GetStage() != stage) {
@@ -5894,8 +5920,11 @@ class Benchmark {
       DBWithColumnFamilies local_db;
       DBWithColumnFamilies* db_with_cfh;
       if (FLAGS_reopen_after_each_op) {
+        uint64_t attempts_this_op = 0;
         OpenDbWithRetry(&local_db,
-                        FLAGS_report_open_timing ? &total_open_nanos : nullptr);
+                        FLAGS_report_open_timing ? &total_open_nanos : nullptr,
+                        &attempts_this_op);
+        total_open_attempts += attempts_this_op;
         db_with_cfh = &local_db;
       } else {
         db_with_cfh = SelectDBWithCfh(id);
@@ -6177,6 +6206,9 @@ class Benchmark {
       snprintf(open_msg, sizeof(open_msg), "( total_open_time: %.3f ms )",
                total_open_nanos / 1000000.0);
       thread->stats.AddMessage(open_msg);
+    }
+    if (FLAGS_reopen_after_each_op) {
+      thread->stats.AddOpenAttempts(total_open_attempts);
     }
     thread->stats.AddBytes(bytes);
   }
@@ -8191,13 +8223,17 @@ class Benchmark {
       ts_guard.reset(new char[user_timestamp_size_]);
     }
     uint64_t total_open_nanos = 0;
+    uint64_t total_open_attempts = 0;
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
       DBWithColumnFamilies local_db;
       DB* db;
       if (FLAGS_reopen_after_each_op) {
+        uint64_t attempts_this_op = 0;
         OpenDbWithRetry(&local_db,
-                        FLAGS_report_open_timing ? &total_open_nanos : nullptr);
+                        FLAGS_report_open_timing ? &total_open_nanos : nullptr,
+                        &attempts_this_op);
+        total_open_attempts += attempts_this_op;
         db = local_db.db;
       } else {
         db = SelectDB(thread);
@@ -8252,6 +8288,9 @@ class Benchmark {
       snprintf(open_msg, sizeof(open_msg), "( total_open_time: %.3f ms )",
                total_open_nanos / 1000000.0);
       thread->stats.AddMessage(open_msg);
+    }
+    if (FLAGS_reopen_after_each_op) {
+      thread->stats.AddOpenAttempts(total_open_attempts);
     }
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);
